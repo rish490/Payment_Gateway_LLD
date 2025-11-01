@@ -1,0 +1,221 @@
+💳 Payment Gateway LLD — Question & Answer Deep Dive
+1️⃣ What happens if debit succeeds but credit fails (partial failure)?
+
+Answer:
+That’s called a partial failure. The payer’s account is debited, but the payee’s account fails to be credited due to a downstream issue (like a network or account freeze).
+
+To handle this:
+
+Mark the transaction as PENDING_REFUND.
+
+Push a refund task into a background queue.
+
+An async worker retries the refund until success.
+
+If all retries fail, mark it as REFUND_FAILED and send an alert for manual reconciliation.
+
+Example pseudocode:
+
+bool processPayment(Payer payer, Payee payee, double amt) {
+    if (!bank.debit(payer.account, amt)) return markFailed();
+    if (!bank.credit(payee.account, amt)) {
+        markPendingRefund();
+        RefundQueue.push({txnId, payer.account, amt});
+        return false;
+    }
+    return markSuccess();
+}
+
+
+In interviews say:
+
+“I’d handle it with a compensation flow — if credit fails, I enqueue an async refund job to reverse the debit. This ensures consistency even under partial failures.”
+
+2️⃣ How can you make refunds and failed tasks retry automatically?
+
+Answer:
+By using a retry queue system. When an operation like a refund fails, instead of blocking or giving up, you push it into a persistent queue with retry metadata.
+
+A worker process picks up failed jobs and retries after a backoff interval.
+
+If it fails multiple times, it moves to a Dead Letter Queue (DLQ) for manual review.
+
+Example pseudocode:
+
+struct Task { string txnId; int retryCount; };
+
+void workerLoop() {
+  Task t = queue.pop();
+  bool ok = bank.refund(t.txnId);
+  if (ok) markRefunded(t.txnId);
+  else if (t.retryCount < 5) {
+    t.retryCount++;
+    queue.pushWithDelay(t, backoff(t.retryCount));
+  } else {
+    dlq.push(t);
+    alertOps(t);
+  }
+}
+
+
+In interviews say:
+
+“I’d use a durable retry queue with exponential backoff and DLQ. This helps recover from transient network issues without manual intervention.”
+
+3️⃣ What are idempotency keys and why are they important in payments?
+
+Answer:
+Idempotency keys prevent duplicate charges caused by retries (for example, user clicks “Pay” twice or the network resends a request).
+
+Each payment request includes a unique idempotency key (UUID).
+
+The server checks if a transaction with the same key already exists.
+
+If yes → return the previous result.
+
+If no → create a new payment intent.
+
+Example:
+
+POST /payments
+Headers: Idempotency-Key: 3a2f-xxxx-7bf
+Body: { payer: "U1", payee: "U2", amount: 500 }
+
+
+Server logic:
+
+if (repository.exists(key))
+    return repository.previousResponse(key);
+else
+    return initiateNewPayment(key);
+
+
+In interviews say:
+
+“I’d use client-generated idempotency keys stored with each payment intent to ensure the same request doesn’t get processed twice.”
+
+4️⃣ How do you handle concurrency when multiple payments hit the same account?
+
+Answer:
+Concurrent transactions can cause race conditions — e.g., two debits from the same account simultaneously.
+
+To handle this:
+
+Database locking: SELECT ... FOR UPDATE while updating balance.
+
+Optimistic locking: use a version field and retry failed updates.
+
+In-memory lock: a mutex for single-process setups.
+
+Queue partitioning: route all operations for the same account to one queue/consumer.
+
+Example (simple mutex version):
+
+class Account {
+  mutex mtx; double balance;
+  bool debit(double amt) {
+    lock_guard<mutex> g(mtx);
+    if (balance < amt) return false;
+    balance -= amt;
+    return true;
+  }
+};
+
+
+In interviews say:
+
+“I’d use a DB-level transaction with SELECT ... FOR UPDATE for atomic debits, or optimistic locking in a high-scale system.”
+
+5️⃣ How can you easily add new payment types (UPI, Card, Wallet) without rewriting logic?
+
+Answer:
+Use the Strategy + Factory Pattern.
+
+Define a PaymentProcessor interface.
+
+Create separate implementations for each payment method.
+
+A factory returns the correct processor at runtime.
+
+Example pseudocode:
+
+interface PaymentProcessor { bool process(PaymentIntent); }
+
+class UPIProcessor : PaymentProcessor { ... }
+class CardProcessor : PaymentProcessor { ... }
+
+PaymentProcessor* PaymentFactory(string method) {
+  if (method == "UPI") return new UPIProcessor();
+  if (method == "CARD") return new CardProcessor();
+}
+
+
+In interviews say:
+
+“I’d use the Strategy pattern so that adding new payment types doesn’t affect the main gateway logic — only a new processor class needs to be added.”
+
+6️⃣ How do you track the status of a payment in real-time?
+
+Answer:
+Every transaction moves through defined states — e.g.,
+CREATED → PROCESSING → SUCCESS / FAILED → PENDING_REFUND → REFUNDED.
+
+Maintain these states in a transactions table.
+
+Update state after each processing step.
+
+Notify clients via:
+
+Webhooks for merchants.
+
+SSE / WebSocket for live apps.
+
+Polling API (GET /payments/:id) as fallback.
+
+Example state diagram:
+
+CREATED → PROCESSING → SUCCESS
+          ↘︎ FAILED → PENDING_REFUND → REFUNDED
+
+
+In interviews say:
+
+“I’d maintain explicit states in DB and notify clients via webhooks or real-time channels. This makes async systems predictable and user-friendly.”
+
+7️⃣ How do you ensure security and auditability of transactions?
+
+Answer:
+Payments involve sensitive data — so security is critical.
+
+Key points:
+
+Tokenization: never store real card numbers, store tokens.
+
+Encryption: encrypt sensitive columns, use TLS for all traffic.
+
+Audit logs: keep immutable logs for every payment step (for compliance).
+
+Access control: least-privilege DB and API keys.
+
+Fraud checks: velocity limits, threshold alerts.
+
+Example pseudocode:
+
+void audit(string txnId, string actor, string action, string note) {
+    insertInto(audit_log, {txnId, actor, action, note, now()});
+}
+
+
+In interviews say:
+
+“I’d use tokenization, encryption, and strict access controls. Every transaction change gets an audit log entry for traceability and compliance.”
+
+🧭 Bonus: Summary for Quick Revision
+#	Concept	Purpose	Key Idea
+1	Partial failure	Ensure money consistency	Async refund via queue
+2	Retry queue	Recover transient failures	Backoff + DLQ
+3	Idempotency	Avoid duplicate charges	UUID key per request
+4	Concurrency	Prevent race conditions	Locks / atomic transactions
+5	Extensibility	Add new payment methods easily	Strategy + Factory
+6	Status tracking	Real-time transparency	States + Webhooks
+7	Security & Audit	Compliance & trust	Tokenization + Logs
